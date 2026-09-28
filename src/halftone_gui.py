@@ -1,593 +1,611 @@
 from __future__ import annotations
 
-import os
-import sys
-import tkinter as tk
+import argparse
+import json
+import threading
+import time
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
-import math
+from tkinter import *
+from tkinter import messagebox, filedialog, ttk
+from typing import Callable
 
-# Ensure the module can import from the same directory
-sys.path.insert(0, str(Path(__file__).parent))
+from PIL import Image, ImageTk, ImageEnhance
+import serial
+import serial.tools.list_ports
 
-try:
-    from stone_halftone import process_image, adjust_image, build_halftone_points, generate_preview_image
-    from grbl_exporter import export_gcode
-except ImportError:
-    messagebox.showerror("Lỗi import", "Không tìm thấy module stone_halftone.py")
-    sys.exit(1)
+from stone_halftone import process_image
 
 
-class SyncCanvas:
-    """Synchronized canvas for image display with zoom and pan."""
+class GRBLController:
+    """Handle serial communication with GRBL machine."""
     
-    def __init__(self, parent, sync_group=None):
-        self.parent = parent
-        self.canvas = tk.Canvas(parent, bg="lightgray", highlightthickness=0, cursor="hand2")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.serial = None
+        self.connected = False
+        self.status_callback: Callable[[str], None] | None = None
         
-        # Scrollbars
-        self.scrollbar_h = tk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        self.scrollbar_v = tk.Scrollbar(parent, orient=tk.VERTICAL, command=self.canvas.yview)
+    def connect(self) -> bool:
+        """Connect to GRBL machine."""
+        try:
+            self.serial = serial.Serial(
+                self.port,
+                self.baudrate,
+                timeout=self.timeout
+            )
+            time.sleep(2)  # Wait for connection stabilization
+            self.connected = True
+            self._log("Connected to GRBL")
+            return True
+        except Exception as e:
+            self._log(f"Connection failed: {e}")
+            return False
+    
+    def disconnect(self) -> bool:
+        """Disconnect from GRBL machine."""
+        try:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+                self.connected = False
+                self._log("Disconnected")
+                return True
+        except Exception as e:
+            self._log(f"Disconnect failed: {e}")
+        return False
+    
+    def send_gcode(self, gcode: str, callback: Callable[[str], None] | None = None) -> bool:
+        """Send G-code to GRBL machine."""
+        if not self.connected or not self.serial:
+            self._log("Not connected to GRBL")
+            return False
         
-        self.canvas.config(xscrollcommand=self.on_scroll_x, yscrollcommand=self.on_scroll_y)
+        try:
+            lines = [line.strip() for line in gcode.split('\n') if line.strip() and not line.startswith(';')]
+            
+            for i, line in enumerate(lines):
+                self.serial.write((line + '\n').encode())
+                
+                # Wait for response
+                response = self._read_response()
+                self._log(f"[{i+1}/{len(lines)}] {line}")
+                
+                if callback:
+                    callback(f"Sent {i+1}/{len(lines)}")
+                
+                if 'error' in response.lower():
+                    self._log(f"GRBL Error: {response}")
+                    return False
+                
+                time.sleep(0.01)  # Small delay between commands
+            
+            self._log("G-code sent successfully")
+            return True
+        except Exception as e:
+            self._log(f"Send failed: {e}")
+            return False
+    
+    def get_status(self) -> str:
+        """Get GRBL machine status."""
+        if not self.connected or not self.serial:
+            return "Not connected"
         
-        # Image data
-        self.original_image = None
-        self.displayed_image = None
-        self.photo_image = None
-        self.canvas_image_id = None
+        try:
+            self.serial.write(b'?\n')
+            response = self._read_response()
+            return response
+        except Exception as e:
+            return f"Status error: {e}"
+    
+    def _read_response(self, timeout: float = 2.0) -> str:
+        """Read response from GRBL."""
+        start = time.time()
+        response = ""
         
-        # Zoom and pan state
+        while time.time() - start < timeout:
+            if self.serial.in_waiting:
+                byte = self.serial.read(1)
+                if byte:
+                    response += byte.decode('utf-8', errors='ignore')
+                    if response.endswith('\n'):
+                        break
+            time.sleep(0.01)
+        
+        return response.strip()
+    
+    def _log(self, message: str):
+        """Log message."""
+        if self.status_callback:
+            self.status_callback(message)
+
+
+class SyncCanvasManager:
+    """Manage synchronized zoom/pan between two canvases."""
+    
+    def __init__(self, canvas1: Canvas, canvas2: Canvas):
+        self.canvas1 = canvas1
+        self.canvas2 = canvas2
         self.zoom = 1.0
-        self.pan_x = 0
-        self.pan_y = 0
-        self.pan_start_x = 0
-        self.pan_start_y = 0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.dragging = False
+        self.drag_start = (0, 0)
         
-        # Sync group
-        self.sync_group = sync_group or []
-        self.sync_group.append(self)
-        self.is_syncing = False
-        
-        # Event bindings
-        self.canvas.bind("<MouseWheel>", self.on_wheel)
-        self.canvas.bind("<Button-4>", self.on_wheel)  # Linux scroll up
-        self.canvas.bind("<Button-5>", self.on_wheel)  # Linux scroll down
-        self.canvas.bind("<Button-1>", self.on_pan_start)
-        self.canvas.bind("<B1-Motion>", self.on_pan_move)
-        self.canvas.bind("<ButtonRelease-1>", self.on_pan_end)
+        # Bind events
+        for canvas in [self.canvas1, self.canvas2]:
+            canvas.bind("<MouseWheel>", self._on_scroll)
+            canvas.bind("<Button-4>", self._on_scroll)  # Linux scroll up
+            canvas.bind("<Button-5>", self._on_scroll)  # Linux scroll down
+            canvas.bind("<Button-1>", self._on_drag_start)
+            canvas.bind("<B1-Motion>", self._on_drag)
+            canvas.bind("<ButtonRelease-1>", self._on_drag_end)
     
-    def on_scroll_x(self, *args):
-        """Handle horizontal scroll."""
-        if not self.is_syncing:
-            self.sync_scroll()
-        self.scrollbar_h.set(*args)
+    def _on_scroll(self, event):
+        """Handle scroll wheel zoom."""
+        delta = 1.1 if event.num == 4 or event.delta > 0 else 0.9
+        self.zoom *= delta
+        self.zoom = max(0.1, min(self.zoom, 10.0))  # Clamp zoom
     
-    def on_scroll_y(self, *args):
-        """Handle vertical scroll."""
-        if not self.is_syncing:
-            self.sync_scroll()
-        self.scrollbar_v.set(*args)
+    def _on_drag_start(self, event):
+        """Start pan drag."""
+        self.dragging = True
+        self.drag_start = (event.x, event.y)
     
-    def sync_scroll(self):
-        """Sync scroll position with other canvases."""
-        for canvas in self.sync_group:
-            if canvas != self:
-                canvas.is_syncing = True
-                canvas.canvas.xview_moveto(self.canvas.xview()[0])
-                canvas.canvas.yview_moveto(self.canvas.yview()[0])
-                canvas.is_syncing = False
-    
-    def display_image(self, image: Image.Image):
-        """Display image."""
-        self.original_image = image.convert("RGB")
-        self.zoom = 1.0
-        self.pan_x = 0
-        self.pan_y = 0
-        self.update_canvas()
-    
-    def update_canvas(self):
-        """Update canvas with current zoom/pan."""
-        if not self.original_image:
+    def _on_drag(self, event):
+        """Pan during drag."""
+        if not self.dragging:
             return
         
-        # Calculate new size
-        w = max(1, int(self.original_image.width * self.zoom))
-        h = max(1, int(self.original_image.height * self.zoom))
-        
-        # Resize image
-        self.displayed_image = self.original_image.resize((w, h), Image.Resampling.LANCZOS)
-        self.photo_image = ImageTk.PhotoImage(self.displayed_image)
-        
-        # Update canvas
-        if self.canvas_image_id:
-            self.canvas.delete(self.canvas_image_id)
-        
-        self.canvas_image_id = self.canvas.create_image(
-            self.pan_x, self.pan_y, image=self.photo_image, anchor="nw"
-        )
-        
-        # Update scroll region
-        self.canvas.config(scrollregion=self.canvas.bbox("all"))
-        
-        # Sync with other canvases
-        self.sync_zoom_pan()
-    
-    def on_wheel(self, event):
-        """Handle mouse wheel zoom."""
-        if not self.original_image:
-            return
-        
-        # Get mouse position
-        x = self.canvas.canvasx(event.x)
-        y = self.canvas.canvasy(event.y)
-        
-        # Zoom factor
-        if event.num in (4, 5) or event.delta < 0:
-            factor = 0.8  # Zoom out
-        else:
-            factor = 1.25  # Zoom in
-        
-        # Calculate new zoom
-        old_zoom = self.zoom
-        self.zoom = max(0.1, min(5.0, self.zoom * factor))
-        
-        # Adjust pan to keep mouse position stable
-        self.pan_x = x - (x - self.pan_x) * (self.zoom / old_zoom)
-        self.pan_y = y - (y - self.pan_y) * (self.zoom / old_zoom)
-        
-        self.update_canvas()
-    
-    def on_pan_start(self, event):
-        """Start panning."""
-        self.pan_start_x = event.x
-        self.pan_start_y = event.y
-    
-    def on_pan_move(self, event):
-        """Handle panning."""
-        dx = event.x - self.pan_start_x
-        dy = event.y - self.pan_start_y
+        dx = event.x - self.drag_start[0]
+        dy = event.y - self.drag_start[1]
         
         self.pan_x += dx
         self.pan_y += dy
+        self.drag_start = (event.x, event.y)
+    
+    def _on_drag_end(self, event):
+        """End pan drag."""
+        self.dragging = False
+    
+    def get_transform(self) -> tuple[float, float, float]:
+        """Get current zoom and pan values."""
+        return self.zoom, self.pan_x, self.pan_y
+    
+    def reset(self):
+        """Reset zoom and pan to default."""
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+
+class HalftoneEngraverGUI:
+    """Main GUI application."""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Stone Halftone Engraver - GRBL Control")
+        self.root.geometry("1600x1000")
         
-        self.pan_start_x = event.x
-        self.pan_start_y = event.y
+        # State
+        self.input_image_path = None
+        self.processed = False
+        self.original_image = None
+        self.preview_image = None
+        self.gcode_content = None
         
-        self.update_canvas()
+        # GRBL
+        self.grbl = None
+        
+        # Image editing
+        self.brightness = 1.0
+        self.contrast = 1.0
+        self.cell_size_mm = 3.0
+        self.tool_diameter_mm = 1.2
+        self.dwell_s = 0.08
+        self.pwm_threshold = 20
+        
+        self._build_ui()
+        self._setup_grbl_ports()
     
-    def on_pan_end(self, event):
-        """End panning."""
-        pass
+    def _build_ui(self):
+        """Build GUI layout."""
+        # Main container
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # Top: GRBL connection panel
+        self._build_grbl_panel(main_frame)
+        
+        # Middle: Image display area
+        image_frame = ttk.LabelFrame(main_frame, text="Image Preview & Zoom/Pan (Sync)", padding=5)
+        image_frame.pack(fill=BOTH, expand=True, pady=10)
+        
+        # Left: Original image
+        left_frame = ttk.Frame(image_frame)
+        left_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=5)
+        
+        ttk.Label(left_frame, text="Original Image", font=("Arial", 10, "bold")).pack()
+        self.canvas_original = Canvas(left_frame, bg="white", height=400)
+        self.canvas_original.pack(fill=BOTH, expand=True)
+        
+        # Right: Preview (halftone) image
+        right_frame = ttk.Frame(image_frame)
+        right_frame.pack(side=RIGHT, fill=BOTH, expand=True, padx=5)
+        
+        ttk.Label(right_frame, text="Halftone Preview", font=("Arial", 10, "bold")).pack()
+        self.canvas_preview = Canvas(right_frame, bg="white", height=400)
+        self.canvas_preview.pack(fill=BOTH, expand=True)
+        
+        # Initialize sync canvas
+        self.sync_canvas = SyncCanvasManager(self.canvas_original, self.canvas_preview)
+        
+        # Left panel: Controls
+        left_panel = ttk.Frame(main_frame)
+        left_panel.pack(side=LEFT, fill=BOTH, padx=10)
+        
+        self._build_controls_panel(left_panel)
+        
+        # Right panel: Log
+        right_panel = ttk.Frame(main_frame)
+        right_panel.pack(side=RIGHT, fill=BOTH, expand=True, padx=10)
+        
+        self._build_log_panel(right_panel)
     
-    def sync_zoom_pan(self):
-        """Sync zoom and pan with other canvases."""
-        for canvas in self.sync_group:
-            if canvas != self:
-                canvas.zoom = self.zoom
-                canvas.pan_x = self.pan_x
-                canvas.pan_y = self.pan_y
-                canvas.update_canvas()
+    def _build_grbl_panel(self, parent):
+        """Build GRBL connection panel."""
+        grbl_frame = ttk.LabelFrame(parent, text="GRBL Machine Connection", padding=10)
+        grbl_frame.pack(fill=X, pady=5)
+        
+        # Port selection
+        port_frame = ttk.Frame(grbl_frame)
+        port_frame.pack(fill=X, pady=5)
+        
+        ttk.Label(port_frame, text="COM Port:", width=12).pack(side=LEFT)
+        self.port_combo = ttk.Combobox(port_frame, width=15, state="readonly")
+        self.port_combo.pack(side=LEFT, padx=5)
+        
+        ttk.Button(port_frame, text="Refresh Ports", command=self._setup_grbl_ports).pack(side=LEFT)
+        
+        # Status
+        status_frame = ttk.Frame(grbl_frame)
+        status_frame.pack(fill=X, pady=5)
+        
+        ttk.Label(status_frame, text="Status:", width=12).pack(side=LEFT)
+        self.status_label = ttk.Label(status_frame, text="Disconnected", foreground="red")
+        self.status_label.pack(side=LEFT, padx=5)
+        
+        # Connect/Disconnect buttons
+        button_frame = ttk.Frame(grbl_frame)
+        button_frame.pack(fill=X, pady=5)
+        
+        self.connect_btn = ttk.Button(button_frame, text="Connect", command=self._connect_grbl)
+        self.connect_btn.pack(side=LEFT, padx=5)
+        
+        self.disconnect_btn = ttk.Button(button_frame, text="Disconnect", command=self._disconnect_grbl, state=DISABLED)
+        self.disconnect_btn.pack(side=LEFT, padx=5)
+        
+        ttk.Button(button_frame, text="Get Status", command=self._get_grbl_status).pack(side=LEFT, padx=5)
     
-    def fit_to_window(self):
-        """Fit image to window."""
+    def _build_controls_panel(self, parent):
+        """Build control panel."""
+        # File selection
+        file_frame = ttk.LabelFrame(parent, text="Image", padding=5)
+        file_frame.pack(fill=X, pady=5)
+        
+        ttk.Button(file_frame, text="Load Image", command=self._load_image, width=20).pack(fill=X, pady=3)
+        self.image_label = ttk.Label(file_frame, text="No image loaded", foreground="gray", wraplength=150)
+        self.image_label.pack(fill=X, pady=3)
+        
+        # Image adjustments
+        adj_frame = ttk.LabelFrame(parent, text="Adjustments", padding=5)
+        adj_frame.pack(fill=X, pady=5)
+        
+        # Brightness
+        ttk.Label(adj_frame, text="Brightness:", width=15).pack(anchor=W)
+        self.brightness_scale = ttk.Scale(adj_frame, from_=0.2, to=2.5, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.brightness_scale.set(1.0)
+        self.brightness_scale.pack(fill=X, pady=2)
+        self.brightness_label = ttk.Label(adj_frame, text="1.00")
+        self.brightness_label.pack(anchor=E)
+        
+        # Contrast
+        ttk.Label(adj_frame, text="Contrast:", width=15).pack(anchor=W)
+        self.contrast_scale = ttk.Scale(adj_frame, from_=0.2, to=3.0, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.contrast_scale.set(1.0)
+        self.contrast_scale.pack(fill=X, pady=2)
+        self.contrast_label = ttk.Label(adj_frame, text="1.00")
+        self.contrast_label.pack(anchor=E)
+        
+        # Halftone parameters
+        param_frame = ttk.LabelFrame(parent, text="Halftone", padding=5)
+        param_frame.pack(fill=X, pady=5)
+        
+        # Cell size
+        ttk.Label(param_frame, text="Cell Size (mm):", width=15).pack(anchor=W)
+        self.cell_size_scale = ttk.Scale(param_frame, from_=1.0, to=10.0, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.cell_size_scale.set(3.0)
+        self.cell_size_scale.pack(fill=X, pady=2)
+        self.cell_size_label = ttk.Label(param_frame, text="3.00")
+        self.cell_size_label.pack(anchor=E)
+        
+        # Tool diameter
+        ttk.Label(param_frame, text="Tool Diameter (mm):", width=15).pack(anchor=W)
+        self.tool_diameter_scale = ttk.Scale(param_frame, from_=0.5, to=5.0, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.tool_diameter_scale.set(1.2)
+        self.tool_diameter_scale.pack(fill=X, pady=2)
+        self.tool_diameter_label = ttk.Label(param_frame, text="1.20")
+        self.tool_diameter_label.pack(anchor=E)
+        
+        # PWM threshold
+        ttk.Label(param_frame, text="PWM Threshold:", width=15).pack(anchor=W)
+        self.pwm_threshold_scale = ttk.Scale(param_frame, from_=0, to=100, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.pwm_threshold_scale.set(20)
+        self.pwm_threshold_scale.pack(fill=X, pady=2)
+        self.pwm_threshold_label = ttk.Label(param_frame, text="20")
+        self.pwm_threshold_label.pack(anchor=E)
+        
+        # Dwell time
+        ttk.Label(param_frame, text="Dwell Time (s):", width=15).pack(anchor=W)
+        self.dwell_time_scale = ttk.Scale(param_frame, from_=0.01, to=1.0, orient=HORIZONTAL, command=self._on_adjustment_change)
+        self.dwell_time_scale.set(0.08)
+        self.dwell_time_scale.pack(fill=X, pady=2)
+        self.dwell_time_label = ttk.Label(param_frame, text="0.08")
+        self.dwell_time_label.pack(anchor=E)
+        
+        # Action buttons
+        action_frame = ttk.LabelFrame(parent, text="Actions", padding=5)
+        action_frame.pack(fill=X, pady=5)
+        
+        ttk.Button(action_frame, text="Generate G-code", command=self._generate_gcode, width=20).pack(fill=X, pady=3)
+        ttk.Button(action_frame, text="Save G-code", command=self._save_gcode, width=20).pack(fill=X, pady=3)
+        ttk.Button(action_frame, text="Send to GRBL", command=self._send_to_grbl, width=20).pack(fill=X, pady=3)
+        
+        # Reset zoom
+        ttk.Button(action_frame, text="Reset Zoom/Pan", command=self._reset_zoom, width=20).pack(fill=X, pady=3)
+    
+    def _build_log_panel(self, parent):
+        """Build log panel."""
+        log_frame = ttk.LabelFrame(parent, text="Log", padding=5)
+        log_frame.pack(fill=BOTH, expand=True)
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(log_frame)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        
+        # Text widget
+        self.log_text = Text(log_frame, height=30, width=50, yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.config(command=self.log_text.yview)
+    
+    def _log(self, message: str):
+        """Add message to log."""
+        self.log_text.insert(END, f"{message}\n")
+        self.log_text.see(END)
+        self.root.update()
+    
+    def _setup_grbl_ports(self):
+        """Setup available GRBL COM ports."""
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.port_combo['values'] = ports if ports else ["No ports found"]
+        if ports:
+            self.port_combo.current(0)
+    
+    def _connect_grbl(self):
+        """Connect to GRBL machine."""
+        port = self.port_combo.get()
+        if port == "No ports found":
+            messagebox.showerror("Error", "No COM ports available")
+            return
+        
+        self.grbl = GRBLController(port)
+        self.grbl.status_callback = self._log
+        
+        if self.grbl.connect():
+            self.status_label.config(text="Connected", foreground="green")
+            self.connect_btn.config(state=DISABLED)
+            self.disconnect_btn.config(state=NORMAL)
+            self._log(f"Connected to {port}")
+        else:
+            messagebox.showerror("Error", "Failed to connect to GRBL")
+    
+    def _disconnect_grbl(self):
+        """Disconnect from GRBL machine."""
+        if self.grbl:
+            self.grbl.disconnect()
+            self.status_label.config(text="Disconnected", foreground="red")
+            self.connect_btn.config(state=NORMAL)
+            self.disconnect_btn.config(state=DISABLED)
+            self._log("Disconnected from GRBL")
+    
+    def _get_grbl_status(self):
+        """Get GRBL machine status."""
+        if not self.grbl or not self.grbl.connected:
+            messagebox.showwarning("Warning", "Not connected to GRBL")
+            return
+        
+        status = self.grbl.get_status()
+        self._log(f"GRBL Status: {status}")
+    
+    def _load_image(self):
+        """Load image file."""
+        filetypes = [("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")]
+        path = filedialog.askopenfilename(filetypes=filetypes)
+        
+        if not path:
+            return
+        
+        try:
+            self.input_image_path = path
+            self.original_image = Image.open(path).convert("L")
+            self.image_label.config(text=Path(path).name, foreground="black")
+            self._log(f"Loaded: {Path(path).name}")
+            self._display_original_image()
+            self.processed = False
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image: {e}")
+            self._log(f"Error loading image: {e}")
+    
+    def _display_original_image(self):
+        """Display original image on canvas."""
         if not self.original_image:
             return
         
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
+        # Resize to fit canvas
+        canvas_width = self.canvas_original.winfo_width()
+        canvas_height = self.canvas_original.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            canvas_width = 400
+            canvas_height = 400
         
-        if canvas_w <= 1 or canvas_h <= 1:
-            canvas_w = 400
-            canvas_h = 400
+        img = self.original_image.copy()
+        img.thumbnail((canvas_width, canvas_height), Image.Resampling.LANCZOS)
         
-        zoom_w = canvas_w / self.original_image.width
-        zoom_h = canvas_h / self.original_image.height
-        
-        self.zoom = min(zoom_w, zoom_h) * 0.95
-        self.pan_x = 0
-        self.pan_y = 0
-        
-        self.update_canvas()
-
-
-class HalftoneApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Stone Halftone Engraver - PWM Vibration Motor")
-        self.geometry("1600x900")
-        self.resizable(True, True)
-
-        # Variables
-        self.input_path = tk.StringVar(value="")
-        self.output_path = tk.StringVar(value="")
-        self.brightness = tk.DoubleVar(value=1.0)
-        self.contrast = tk.DoubleVar(value=1.0)
-        self.cell_size_mm = tk.DoubleVar(value=3.0)
-        self.tool_diameter_mm = tk.DoubleVar(value=1.2)
-        self.dwell_time = tk.DoubleVar(value=0.08)
-        self.export_format = tk.StringVar(value="grbl")
-
-        # Data
-        self.last_input_image = None
-        self.last_preview_image = None
-        self.last_gcode = None
-        self.last_points = None
-        self.sync_group = []
-
-        self.build_ui()
-        self.update_output_path()
-
-    def build_ui(self):
-        """Build 3-column layout: controls | input image | halftone image."""
-        # Main container
-        main_container = tk.Frame(self)
-        main_container.pack(fill=tk.BOTH, expand=True)
-
-        # ===== LEFT PANEL: CONTROLS =====
-        left_panel = tk.Frame(main_container, bg="white", width=300)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=8)
-        left_panel.pack_propagate(False)
-
-        # Scrollable controls
-        canvas_controls = tk.Canvas(left_panel, bg="white", highlightthickness=0)
-        scrollbar = tk.Scrollbar(left_panel, orient=tk.VERTICAL, command=canvas_controls.yview)
-        scrollable_frame = tk.Frame(canvas_controls, bg="white")
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas_controls.configure(scrollregion=canvas_controls.bbox("all"))
-        )
-
-        canvas_controls.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas_controls.configure(yscrollcommand=scrollbar.set)
-
-        # Bind mousewheel
-        def _on_mousewheel(event):
-            canvas_controls.yview_scroll(int(-1*(event.delta/120)), "units")
-        scrollable_frame.bind_all("<MouseWheel>", _on_mousewheel)
-
-        canvas_controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.build_controls(scrollable_frame)
-
-        # ===== CENTER PANEL: INPUT IMAGE =====
-        center_panel = tk.Frame(main_container, bg="gray20")
-        center_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-
-        tk.Label(center_panel, text="📷 Ảnh gốc", font=("Arial", 10, "bold"), bg="gray20", fg="white").pack()
-
-        self.input_canvas = SyncCanvas(center_panel, sync_group=self.sync_group)
-        self.canvas_input = self.input_canvas.canvas
-
-        # ===== RIGHT PANEL: HALFTONE IMAGE =====
-        right_panel = tk.Frame(main_container, bg="gray20")
-        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        tk.Label(right_panel, text="🎨 Ảnh điểm đập", font=("Arial", 10, "bold"), bg="gray20", fg="white").pack()
-
-        self.halftone_canvas = SyncCanvas(right_panel, sync_group=self.sync_group)
-        self.canvas_halftone = self.halftone_canvas.canvas
-
-    def build_controls(self, parent):
-        """Build control panel."""
-        # Title
-        tk.Label(parent, text="⚙️ Điều chỉnh", font=("Arial", 11, "bold"), bg="white").pack(anchor="w", pady=(8, 12))
-
-        # === INPUT IMAGE ===
-        tk.Label(parent, text="📁 Ảnh đầu vào", font=("Arial", 10, "bold"), bg="white").pack(anchor="w", pady=(8, 4))
-        
-        btn_frame = tk.Frame(parent, bg="white")
-        btn_frame.pack(fill=tk.X, pady=(0, 8))
-        
-        tk.Button(btn_frame, text="Chọn ảnh", command=self.select_image, bg="#2196F3", fg="white", width=15).pack(fill=tk.X, padx=4)
-
-        self.label_img_path = tk.Label(parent, text="Chưa chọn ảnh", font=("Arial", 8), bg="white", wraplength=250, justify=tk.LEFT, fg="gray")
-        self.label_img_path.pack(anchor="w", padx=4, pady=(0, 12))
-
-        # === IMAGE ADJUSTMENT ===
-        self.build_section(parent, "🎚️ Điều chỉnh ảnh")
-
-        tk.Label(parent, text="Độ sáng:", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        scale = tk.Scale(parent, variable=self.brightness, from_=0.2, to=2.5, resolution=0.1, orient=tk.HORIZONTAL, bg="#E8E8E8", length=200, command=lambda v: self.refresh_preview())
-        scale.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-        tk.Label(parent, text="Độ tương phản:", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        scale = tk.Scale(parent, variable=self.contrast, from_=0.2, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, bg="#E8E8E8", length=200, command=lambda v: self.refresh_preview())
-        scale.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-        # === ENGRAVING PARAMETERS ===
-        self.build_section(parent, "⚙️ Tham số khắc")
-
-        tk.Label(parent, text="Kích thước ô (mm):", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        scale = tk.Scale(parent, variable=self.cell_size_mm, from_=1.0, to=10.0, resolution=0.5, orient=tk.HORIZONTAL, bg="#E8E8E8", length=200, command=lambda v: self.refresh_preview())
-        scale.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-        tk.Label(parent, text="Đường kính đầu (mm):", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        scale = tk.Scale(parent, variable=self.tool_diameter_mm, from_=0.5, to=4.0, resolution=0.1, orient=tk.HORIZONTAL, bg="#E8E8E8", length=200, command=lambda v: self.refresh_preview())
-        scale.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-        tk.Label(parent, text="Thời gian chạm (s):", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        scale = tk.Scale(parent, variable=self.dwell_time, from_=0.02, to=0.5, resolution=0.02, orient=tk.HORIZONTAL, bg="#E8E8E8", length=200)
-        scale.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-        # === OUTPUT FILES ===
-        self.build_section(parent, "💾 File đầu ra")
-
-        tk.Label(parent, text="G-code:", font=("Arial", 9), bg="white").pack(anchor="w", padx=8)
-        
-        output_frame = tk.Frame(parent, bg="white")
-        output_frame.pack(fill=tk.X, padx=8, pady=(2, 4))
-        
-        tk.Entry(output_frame, textvariable=self.output_path, width=20).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(output_frame, text="📂", command=self.choose_output_dir, width=3).pack(side=tk.LEFT, padx=(4, 0))
-
-        # === EXPORT FORMAT ===
-        self.build_section(parent, "📤 Định dạng xuất")
-
-        formats = [
-            ("GRBL", "grbl"),
-            ("CSV", "csv"),
-            ("JSON", "json"),
-            ("MATLAB", "matlab"),
-        ]
-
-        for label, value in formats:
-            tk.Radiobutton(
-                parent,
-                text=label,
-                variable=self.export_format,
-                value=value,
-                font=("Arial", 9),
-                bg="white"
-            ).pack(anchor="w", padx=12)
-
-        # === ACTION BUTTONS ===
-        tk.Frame(parent, bg="white", height=8).pack()
-
-        btn_gen = tk.Button(
-            parent,
-            text="✓ TẠO G-CODE",
-            command=self.generate,
-            bg="#4CAF50",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            height=2
-        )
-        btn_gen.pack(fill=tk.X, padx=8, pady=(8, 4))
-
-        btn_export = tk.Button(
-            parent,
-            text="📤 XUẤT",
-            command=self.export_gcode,
-            bg="#FF9800",
-            fg="white",
-            font=("Arial", 10, "bold"),
-            height=2
-        )
-        btn_export.pack(fill=tk.X, padx=8, pady=(0, 4))
-
-        btn_copy = tk.Button(
-            parent,
-            text="📋 COPY G-CODE",
-            command=self.copy_gcode,
-            bg="#2196F3",
-            fg="white",
-            font=("Arial", 10, "bold"),
-            height=2
-        )
-        btn_copy.pack(fill=tk.X, padx=8, pady=(0, 4))
-
-        btn_zoom = tk.Button(
-            parent,
-            text="🔍 Fit Images",
-            command=self.fit_images,
-            bg="#9C27B0",
-            fg="white",
-            font=("Arial", 9),
-            height=1
-        )
-        btn_zoom.pack(fill=tk.X, padx=8, pady=(0, 8))
-
-        # Status
-        tk.Frame(parent, bg="white", height=8).pack()
-        self.status_label = tk.Label(parent, text="Sẵn sàng", font=("Arial", 8), bg="white", fg="gray")
-        self.status_label.pack(anchor="w", padx=8)
-
-    def build_section(self, parent, title):
-        """Build a titled section."""
-        tk.Label(parent, text=title, font=("Arial", 10, "bold"), bg="white").pack(anchor="w", padx=8, pady=(12, 6))
-        tk.Frame(parent, bg="#E8E8E8", height=1).pack(fill=tk.X, padx=8, pady=(0, 6))
-
-    def update_output_path(self):
-        """Update output path with timestamp."""
-        from datetime import datetime
-        home = Path.home()
-        output_dir = home / "Downloads" / "stone_engrave"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_path.set(str(output_dir / f"toolpath_{timestamp}.nc"))
-
-    def select_image(self):
-        """Select input image."""
-        filetypes = [
-            ("Hình ảnh", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
-            ("PNG", "*.png"),
-            ("JPEG", "*.jpg *.jpeg"),
-            ("BMP", "*.bmp"),
-            ("Tất cả", "*.*")
-        ]
-        path = filedialog.askopenfilename(
-            title="Chọn ảnh để khắc",
-            filetypes=filetypes
-        )
-        if path:
-            self.input_path.set(path)
-            self.label_img_path.config(text=f"✓ {Path(path).name}")
-            self.refresh_images()
-
-    def choose_output_dir(self):
-        """Choose output directory."""
-        directory = filedialog.askdirectory(title="Chọn thư mục lưu G-code")
-        if directory:
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = Path(directory) / f"toolpath_{timestamp}.nc"
-            self.output_path.set(str(output_file))
-            self.status_label.config(text=f"Thư mục: {directory}", fg="green")
-
-    def refresh_images(self):
-        """Refresh both input and halftone images."""
-        image_path = self.input_path.get()
-        if not image_path or not Path(image_path).exists():
-            self.status_label.config(text="❌ File không tồn tại", fg="red")
+        photo = ImageTk.PhotoImage(img)
+        self.canvas_original.delete("all")
+        self.canvas_original.create_image(canvas_width // 2, canvas_height // 2, image=photo)
+        self.canvas_original.image = photo  # Keep reference
+    
+    def _display_preview_image(self):
+        """Display preview image on canvas."""
+        if not self.preview_image:
             return
-
+        
+        # Resize to fit canvas
+        canvas_width = self.canvas_preview.winfo_width()
+        canvas_height = self.canvas_preview.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            canvas_width = 400
+            canvas_height = 400
+        
+        img = self.preview_image.copy()
+        img.thumbnail((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+        
+        photo = ImageTk.PhotoImage(img)
+        self.canvas_preview.delete("all")
+        self.canvas_preview.create_image(canvas_width // 2, canvas_height // 2, image=photo)
+        self.canvas_preview.image = photo  # Keep reference
+    
+    def _on_adjustment_change(self, value=None):
+        """Handle adjustment slider changes."""
+        self.brightness = float(self.brightness_scale.get())
+        self.contrast = float(self.contrast_scale.get())
+        self.cell_size_mm = float(self.cell_size_scale.get())
+        self.tool_diameter_mm = float(self.tool_diameter_scale.get())
+        self.dwell_s = float(self.dwell_time_scale.get())
+        self.pwm_threshold = int(self.pwm_threshold_scale.get())
+        
+        # Update labels
+        self.brightness_label.config(text=f"{self.brightness:.2f}")
+        self.contrast_label.config(text=f"{self.contrast:.2f}")
+        self.cell_size_label.config(text=f"{self.cell_size_mm:.2f}")
+        self.tool_diameter_label.config(text=f"{self.tool_diameter_mm:.2f}")
+        self.dwell_time_label.config(text=f"{self.dwell_s:.2f}")
+        self.pwm_threshold_label.config(text=f"{self.pwm_threshold}")
+        
+        # Auto-regenerate preview if image is loaded
+        if self.input_image_path and self.original_image:
+            self._generate_gcode()
+    
+    def _generate_gcode(self):
+        """Generate G-code from current image and settings."""
+        if not self.input_image_path:
+            messagebox.showwarning("Warning", "Please load an image first")
+            return
+        
         try:
-            img = Image.open(image_path)
-            self.last_input_image = img.convert("L")
-            self.input_canvas.display_image(img.convert("RGB"))
+            self._log("Generating G-code...")
             
-            self.refresh_preview()
-            self.status_label.config(text="✓ Ảnh tải thành công", fg="green")
-        except Exception as exc:
-            self.status_label.config(text=f"❌ Lỗi: {exc}", fg="red")
-
-    def refresh_preview(self):
-        """Refresh halftone preview."""
-        image_path = self.input_path.get()
-        if not image_path or not Path(image_path).exists():
-            return
-
-        try:
-            adjusted = adjust_image(
-                image_path,
-                brightness=self.brightness.get(),
-                contrast=self.contrast.get()
-            )
-
-            self.last_points = build_halftone_points(
-                adjusted,
-                cell_size_mm=self.cell_size_mm.get(),
-                tool_diameter_mm=self.tool_diameter_mm.get()
-            )
-
-            preview = generate_preview_image(
-                adjusted,
-                self.cell_size_mm.get(),
-                self.tool_diameter_mm.get()
-            )
-            self.last_preview_image = preview
-            self.halftone_canvas.display_image(preview.convert("RGB"))
-
-            self.status_label.config(
-                text=f"✓ {len(self.last_points)} điểm | ô {self.cell_size_mm.get():.1f}mm | đầu {self.tool_diameter_mm.get():.1f}mm",
-                fg="green"
-            )
-        except Exception as exc:
-            self.status_label.config(text=f"❌ Lỗi: {exc}", fg="red")
-
-    def generate(self):
-        """Generate G-code."""
-        image_path = self.input_path.get()
-        if not image_path:
-            messagebox.showerror("Lỗi", "Vui lòng chọn ảnh.")
-            return
-
-        output_path = self.output_path.get()
-        if not output_path:
-            messagebox.showerror("Lỗi", "Vui lòng chọn thư mục đầu ra.")
-            return
-
-        try:
-            # Create directories
-            output_dir = Path(output_path).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            # Verify write permission
-            if not os.access(output_dir, os.W_OK):
-                raise PermissionError(f"Không có quyền ghi: {output_dir}")
-
-            # Generate preview path
-            preview_path = str(output_dir / f"{Path(output_path).stem}_preview.png")
-
+            # Create temporary files
+            temp_dir = Path("temp")
+            temp_dir.mkdir(exist_ok=True)
+            
+            gcode_path = temp_dir / "preview.gcode"
+            preview_path = temp_dir / "preview.png"
+            
             # Process image
             result = process_image(
-                input_path=image_path,
-                output_gcode=output_path,
-                preview_path=preview_path,
-                brightness=self.brightness.get(),
-                contrast=self.contrast.get(),
-                cell_size_mm=self.cell_size_mm.get(),
-                tool_diameter_mm=self.tool_diameter_mm.get(),
-                dwell_s=self.dwell_time.get(),
+                input_path=self.input_image_path,
+                output_gcode=str(gcode_path),
+                preview_path=str(preview_path),
+                brightness=self.brightness,
+                contrast=self.contrast,
+                cell_size_mm=self.cell_size_mm,
+                tool_diameter_mm=self.tool_diameter_mm,
+                dwell_s=self.dwell_s,
+                pwm_threshold=self.pwm_threshold,
             )
-
-            # Read G-code
-            with open(output_path, 'r', encoding='utf-8') as f:
-                self.last_gcode = f.read()
-
-            self.status_label.config(text=f"✓ G-code tạo thành công: {output_path}", fg="green")
-            messagebox.showinfo("Thành công", f"G-code đã tạo:\n{output_path}\n\nTổng điểm: {result['points']}")
-
-        except Exception as exc:
-            self.status_label.config(text=f"❌ Lỗi: {exc}", fg="red")
-            messagebox.showerror("Lỗi", f"Không thể tạo G-code:\n{exc}")
-
-    def export_gcode(self):
-        """Export with selected format."""
-        if not self.last_points:
-            messagebox.showwarning("Cảnh báo", "Tạo G-code trước khi xuất.")
+            
+            # Load preview image
+            self.preview_image = Image.open(preview_path)
+            self._display_preview_image()
+            
+            # Load G-code
+            self.gcode_content = gcode_path.read_text()
+            
+            self._log(f"Generated {result['points']} engraving points")
+            self.processed = True
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate G-code: {e}")
+            self._log(f"Error: {e}")
+    
+    def _save_gcode(self):
+        """Save G-code to file."""
+        if not self.gcode_content:
+            messagebox.showwarning("Warning", "No G-code generated yet")
             return
-
-        fmt = self.export_format.get()
-        output_path = self.output_path.get()
-        output_path = str(Path(output_path).with_suffix(".nc"))
-
-        # Change extension based on format
-        if fmt == "csv":
-            output_path = output_path.replace(".nc", ".csv")
-        elif fmt == "json":
-            output_path = output_path.replace(".nc", ".json")
-        elif fmt == "matlab":
-            output_path = output_path.replace(".nc", ".m")
-
-        try:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            export_gcode(self.last_points, output_path, format_type=fmt, dwell_s=self.dwell_time.get())
-            self.status_label.config(text=f"✓ Xuất {fmt.upper()}: {output_path}", fg="green")
-            messagebox.showinfo("Thành công", f"Đã xuất {fmt.upper()}:\n{output_path}")
-        except Exception as exc:
-            self.status_label.config(text=f"❌ Lỗi xuất: {exc}", fg="red")
-            messagebox.showerror("Lỗi", f"Không thể xuất:\n{exc}")
-
-    def copy_gcode(self):
-        """Copy G-code to clipboard."""
-        if not self.last_gcode:
-            messagebox.showwarning("Cảnh báo", "Tạo G-code trước.")
+        
+        output_dir = filedialog.askdirectory(title="Select output directory")
+        if not output_dir:
             return
-
+        
         try:
-            self.clipboard_clear()
-            self.clipboard_append(self.last_gcode)
-            self.status_label.config(text="✓ G-code copied to clipboard", fg="green")
-            messagebox.showinfo("Thành công", "G-code đã copy vào clipboard")
-        except Exception as exc:
-            messagebox.showerror("Lỗi", f"Không thể copy:\n{exc}")
-
-    def fit_images(self):
-        """Fit both images to window."""
-        self.input_canvas.fit_to_window()
-        self.halftone_canvas.fit_to_window()
-        self.status_label.config(text="✓ Fit to window", fg="green")
+            output_path = Path(output_dir) / "engraving.gcode"
+            output_path.write_text(self.gcode_content, encoding="utf-8")
+            messagebox.showinfo("Success", f"G-code saved to:\n{output_path}")
+            self._log(f"G-code saved: {output_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save G-code: {e}")
+            self._log(f"Error saving: {e}")
+    
+    def _send_to_grbl(self):
+        """Send G-code to GRBL machine."""
+        if not self.grbl or not self.grbl.connected:
+            messagebox.showwarning("Warning", "Not connected to GRBL")
+            return
+        
+        if not self.gcode_content:
+            messagebox.showwarning("Warning", "No G-code generated yet")
+            return
+        
+        if messagebox.askyesno("Confirm", "Send G-code to GRBL machine?"):
+            # Send in background thread
+            def send_thread():
+                self._log("Sending G-code to GRBL...")
+                success = self.grbl.send_gcode(
+                    self.gcode_content,
+                    callback=lambda msg: self._log(msg)
+                )
+                if success:
+                    messagebox.showinfo("Success", "G-code sent successfully")
+                else:
+                    messagebox.showerror("Error", "Failed to send G-code")
+            
+            thread = threading.Thread(target=send_thread, daemon=True)
+            thread.start()
+    
+    def _reset_zoom(self):
+        """Reset zoom and pan."""
+        self.sync_canvas.reset()
+        self._display_original_image()
+        self._display_preview_image()
+        self._log("Zoom/Pan reset")
 
 
 def main():
-    app = HalftoneApp()
-    app.mainloop()
+    root = Tk()
+    app = HalftoneEngraverGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
